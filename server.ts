@@ -84,6 +84,15 @@ app.post(
       res.status(400).json({ ok: false, message: 'No file provided' });
       return;
     }
+
+    console.log('Archivo recibido:', {
+      originalname: req.file.originalname,
+      filename: req.file.filename,
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+      path: req.file.path,
+    });
+
     res.json({
       ok: true,
       filename: req.file.filename,
