@@ -39,6 +39,7 @@ dependencies:
   http: ^1.5.0
   path_provider: ^2.1.5
   http_parser: ^4.0.2
+  geolocator: ^14.0.2
 
 record: ^6.1.1       # Grabación en WAV
 http: ^1.2.2         # POST multipart/form-data
