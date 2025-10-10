@@ -130,8 +130,10 @@ async def _broadcast_new_audio(row: dict):
         "timestamp": row["timestamp"],
         "filename": row["filename"],
         "size": row["size"],
-        # Camino relativo servido por este server. El cliente arma la URL completa.
         "urlPath": f"/audios/{row['filename']}",
+        # NUEVO:
+        "latitude": row.get("latitude", ""),
+        "longitude": row.get("longitude", ""),
     }
 
     drops: List[str] = []
@@ -262,9 +264,13 @@ def list_audios(deviceName: str, limit: int = 50):
             "filename": r["filename"],
             "size": int(r.get("size", "0") or 0),
             "urlPath": f"/audios/{r['filename']}",
+            # NUEVO:
+            "latitude": r.get("latitude", ""),
+            "longitude": r.get("longitude", ""),
         }
         for r in rows
     ]
+
 
 # -------------------- Upload de audio (ya lo tenías) --------------------
 @app.post("/api/audio")
