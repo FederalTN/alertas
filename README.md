@@ -9,11 +9,6 @@ sudo apt install -y python3 python3-venv python3-pip
 # Flutter + Android SDK deps (si no los tenías)
 sudo apt install -y clang cmake ninja-build libgtk-3-dev libblkid-dev liblzma-dev libstdc++-12-dev libsecret-1-dev
 
-
-# Clonar tu repositorio o crear carpeta
-mkdir -p ~/Projects/ServerPython
-cd ~/Projects/ServerPython
-
 # Crear entorno virtual
 python3 -m venv .venv
 source .venv/bin/activate
@@ -21,12 +16,9 @@ source .venv/bin/activate
 # Instalar dependencias
 pip install --upgrade pip
 pip install fastapi uvicorn python-dotenv
-
-# (Opcional si vas a subir archivos grandes y CSV)
 pip install python-multipart
 
 # Crea los archivos
-#   server.py    (el que te di)
 #   .env         (opcional, puedes dejarlo vacío o con valores como)
 cat > .env <<'EOF'
 PORT=4000
