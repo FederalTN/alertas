@@ -26,7 +26,7 @@ pip install fastapi uvicorn python-dotenv
 pip install python-multipart
 
 # Crea los archivos
-#   server.py    (el que te di)
+#   server.py
 #   .env         (opcional, puedes dejarlo vacío o con valores como)
 cat > .env <<'EOF'
 PORT=4000

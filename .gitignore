@@ -78,3 +78,6 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+audios/
+.pt
+.parquet

@@ -36,7 +36,7 @@ class ConnectScreen extends StatefulWidget {
 }
 
 class _ConnectScreenState extends State<ConnectScreen> {
-  final _serverCtrl = TextEditingController(text: 'http://10.0.2.2:4000');
+  final _serverCtrl = TextEditingController(text: 'http://0.0.0.0:4000');
   final _deviceCtrl = TextEditingController();
   bool _connecting = false;
   String? _userId;
@@ -488,7 +488,7 @@ class AudioItem {
    ======================= */
 
 class ClientConnection {
-  final String baseHttp; // p.ej. http://10.0.2.2:4000
+  final String baseHttp; // p.ej. http://0.0.0.0:4000
   late final String _wsUrl; // ws://host:port/ws
   WebSocketChannel? _ch;
   String? userId;

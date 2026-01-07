@@ -1,12 +1,14 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
-import 'package:geolocator/geolocator.dart';
 
 void main() {
   runApp(const AudioMonitorApp());
@@ -28,6 +30,15 @@ class AudioMonitorApp extends StatelessWidget {
   }
 }
 
+/// Lee chunk_seconds desde assets/config.json (ya lo agregaste en pubspec.yaml)
+Future<double> loadChunkSeconds() async {
+  final raw = await rootBundle.loadString('assets/config.json');
+  final jsonMap = json.decode(raw) as Map<String, dynamic>;
+  final v = jsonMap['chunk_seconds'];
+  if (v is num) return v.toDouble();
+  throw Exception('config.json: chunk_seconds no válido');
+}
+
 /// ---------------------------
 /// PANTALLA 1: Configuración
 /// ---------------------------
@@ -44,6 +55,21 @@ class _SetupPageState extends State<SetupPage> {
   final _urlCtrl = TextEditingController(text: 'http://localhost:4000/api/audio');
   final _deviceNameCtrl = TextEditingController(text: 'MiDispositivo');
 
+  double? _chunkSeconds;
+  String? _configError;
+
+  @override
+  void initState() {
+    super.initState();
+    loadChunkSeconds().then((v) {
+      if (!mounted) return;
+      setState(() => _chunkSeconds = v);
+    }).catchError((e) {
+      if (!mounted) return;
+      setState(() => _configError = e.toString());
+    });
+  }
+
   @override
   void dispose() {
     _cantidadCtrl.dispose();
@@ -54,6 +80,12 @@ class _SetupPageState extends State<SetupPage> {
 
   @override
   Widget build(BuildContext context) {
+    final chunkLabel = _configError != null
+        ? 'chunk_seconds: error (${_configError!})'
+        : (_chunkSeconds == null
+            ? 'Leyendo config.json...'
+            : 'chunk_seconds: $_chunkSeconds s');
+
     return Scaffold(
       appBar: AppBar(title: const Text('Configuración')),
       body: Padding(
@@ -62,6 +94,8 @@ class _SetupPageState extends State<SetupPage> {
           key: _formKey,
           child: ListView(
             children: [
+              Text(chunkLabel),
+              const SizedBox(height: 16),
               TextFormField(
                 controller: _cantidadCtrl,
                 decoration: const InputDecoration(
@@ -111,11 +145,16 @@ class _SetupPageState extends State<SetupPage> {
                     final cantidad = int.parse(_cantidadCtrl.text);
                     final url = _urlCtrl.text.trim();
                     final deviceName = _deviceNameCtrl.text.trim();
+
+                    // Si no se pudo leer config, usamos fallback 5 min (300s)
+                    final chunkSeconds = _chunkSeconds ?? 300.0;
+
                     Navigator.of(context).push(MaterialPageRoute(
                       builder: (_) => MonitorPage(
                         cantidad: cantidad,
                         endpointUrl: url,
                         deviceName: deviceName,
+                        chunkSeconds: chunkSeconds,
                       ),
                     ));
                   }
@@ -161,11 +200,13 @@ class MonitorPage extends StatefulWidget {
     required this.cantidad,
     required this.endpointUrl,
     required this.deviceName,
+    required this.chunkSeconds,
   });
 
   final int cantidad;
   final String endpointUrl;
   final String deviceName;
+  final double chunkSeconds;
 
   @override
   State<MonitorPage> createState() => _MonitorPageState();
@@ -272,10 +313,13 @@ class _MonitorPageState extends State<MonitorPage> {
 
       await _recorder.start(cfg, path: path);
 
-      const dur = Duration(minutes: 5);
-      for (var s = 0; s < dur.inSeconds; s++) {
+      // ✅ Antes era 5 minutos fijo. Ahora usa chunk_seconds del config.
+      final dur = Duration(milliseconds: (widget.chunkSeconds * 1000).round());
+
+      // Loop con polling para poder cancelar rápido
+      for (var ms = 0; ms < dur.inMilliseconds; ms += 200) {
         if (_cancelado) break;
-        await Future.delayed(const Duration(seconds: 1));
+        await Future.delayed(const Duration(milliseconds: 200));
       }
       if (_cancelado) break;
 
@@ -296,7 +340,9 @@ class _MonitorPageState extends State<MonitorPage> {
 
     if (mounted && !_cancelado) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Monitoreo finalizado ($_hechos/${widget.cantidad})')),
+        SnackBar(
+          content: Text('Monitoreo finalizado ($_hechos/${widget.cantidad})'),
+        ),
       );
     }
   }
@@ -380,7 +426,8 @@ class _MonitorPageState extends State<MonitorPage> {
               if (mounted) Navigator.of(context).pop();
             },
             icon: const Icon(Icons.stop_circle_outlined),
-            label: const Text('Detener', style: TextStyle(fontWeight: FontWeight.bold)),
+            label: const Text('Detener',
+                style: TextStyle(fontWeight: FontWeight.bold)),
           )
         ],
       ),
@@ -393,7 +440,7 @@ class _MonitorPageState extends State<MonitorPage> {
               children: [
                 Expanded(
                   child: Text(
-                    'Grabando segmentos WAV de 5 min\nEnvío: POST → audio + deviceName + lat/long',
+                    'Grabando segmentos WAV de ${widget.chunkSeconds}s\nEnvío: POST → audio + deviceName + lat/long',
                     style: Theme.of(context).textTheme.bodyMedium,
                   ),
                 ),
@@ -421,7 +468,8 @@ class _MonitorPageState extends State<MonitorPage> {
                                 ? Icons.check_circle
                                 : Icons.error_outline,
                   ),
-                  title: Text(a.fileName, maxLines: 1, overflow: TextOverflow.ellipsis),
+                  title: Text(a.fileName,
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
                   subtitle: Text(
                     a.status == UploadStatus.grabando
                         ? 'Grabando...'
@@ -436,7 +484,8 @@ class _MonitorPageState extends State<MonitorPage> {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text('Inicio: ${_fmt(a.startedAt)}'),
-                      if (a.finishedAt != null) Text('Fin: ${_fmt(a.finishedAt!)}'),
+                      if (a.finishedAt != null)
+                        Text('Fin: ${_fmt(a.finishedAt!)}'),
                     ],
                   ),
                 );
