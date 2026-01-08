@@ -81,3 +81,4 @@ wheels/
 audios/
 .pt
 .parquet
+downloaded_models/

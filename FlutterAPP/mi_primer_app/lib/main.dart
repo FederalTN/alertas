@@ -30,7 +30,7 @@ class AudioMonitorApp extends StatelessWidget {
   }
 }
 
-/// Lee chunk_seconds desde assets/config.json (ya lo agregaste en pubspec.yaml)
+/// Lee chunk_seconds desde assets/config.json
 Future<double> loadChunkSeconds() async {
   final raw = await rootBundle.loadString('assets/config.json');
   final jsonMap = json.decode(raw) as Map<String, dynamic>;
@@ -113,7 +113,6 @@ class _SetupPageState extends State<SetupPage> {
                 controller: _urlCtrl,
                 decoration: const InputDecoration(
                   labelText: 'URL de destino (POST)',
-                  hintText: 'http://localhost:4000/api/audio',
                 ),
                 validator: (v) {
                   if (v == null || v.isEmpty) return 'La URL es requerida';
@@ -127,7 +126,6 @@ class _SetupPageState extends State<SetupPage> {
                 controller: _deviceNameCtrl,
                 decoration: const InputDecoration(
                   labelText: 'Device Name',
-                  hintText: 'Ej: SensorPatio01',
                 ),
                 validator: (v) {
                   if (v == null || v.trim().isEmpty) {
@@ -142,19 +140,12 @@ class _SetupPageState extends State<SetupPage> {
                 label: const Text('Comenzar a monitorear'),
                 onPressed: () {
                   if (_formKey.currentState?.validate() ?? false) {
-                    final cantidad = int.parse(_cantidadCtrl.text);
-                    final url = _urlCtrl.text.trim();
-                    final deviceName = _deviceNameCtrl.text.trim();
-
-                    // Si no se pudo leer config, usamos fallback 5 min (300s)
-                    final chunkSeconds = _chunkSeconds ?? 300.0;
-
                     Navigator.of(context).push(MaterialPageRoute(
                       builder: (_) => MonitorPage(
-                        cantidad: cantidad,
-                        endpointUrl: url,
-                        deviceName: deviceName,
-                        chunkSeconds: chunkSeconds,
+                        cantidad: int.parse(_cantidadCtrl.text),
+                        endpointUrl: _urlCtrl.text.trim(),
+                        deviceName: _deviceNameCtrl.text.trim(),
+                        chunkSeconds: _chunkSeconds ?? 300.0,
                       ),
                     ));
                   }
@@ -178,6 +169,8 @@ class AudioItem {
     required this.index,
     required this.fileName,
     required this.startedAt,
+    required this.totalSeconds,
+    this.progressSeconds = 0,
     this.finishedAt,
     this.status = UploadStatus.grabando,
     this.error,
@@ -189,6 +182,9 @@ class AudioItem {
   DateTime? finishedAt;
   UploadStatus status;
   String? error;
+
+  int progressSeconds;      // ✅ segundos actuales
+  final int totalSeconds;   // ✅ segundos totales
 }
 
 /// ---------------------------
@@ -249,43 +245,11 @@ class _MonitorPageState extends State<MonitorPage> {
     return '${dir.path}/audio_${idx + 1}_$ts.wav';
   }
 
-  /// Obtiene la posición actual (si hay permisos y servicios activos).
-  /// Devuelve null si no se puede.
-  Future<Position?> _getPositionSafe() async {
-    try {
-      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      print('[GEO] serviceEnabled=$serviceEnabled');
-      if (!serviceEnabled) {
-        print('[GEO] Servicios de ubicación desactivados');
-        return null;
-      }
-      var permission = await Geolocator.checkPermission();
-      print('[GEO] initialPermission=$permission');
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        print('[GEO] Permiso de ubicación denegado');
-        return null;
-      }
-      final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-      print('[GEO] Posición: ${pos.latitude}, ${pos.longitude}');
-      return pos;
-    } catch (e) {
-      print('[GEO][ERROR] $e');
-      return null;
-    }
-  }
-
   Future<void> _iniciar() async {
     if (_iniciado) return;
     _iniciado = true;
 
-    final ok = await _recorder.hasPermission();
-    if (!ok) {
+    if (!await _recorder.hasPermission()) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Permiso de micrófono denegado')),
@@ -296,211 +260,83 @@ class _MonitorPageState extends State<MonitorPage> {
 
     for (var i = 0; i < widget.cantidad && !_cancelado; i++) {
       final path = await _nuevoPathWav(i);
+      final totalSec = widget.chunkSeconds.round();
 
       final item = AudioItem(
         index: i,
         fileName: path.split('/').last,
         startedAt: DateTime.now(),
-        status: UploadStatus.grabando,
+        totalSeconds: totalSec,
       );
+
       setState(() => _items.insert(0, item));
 
-      final cfg = RecordConfig(
-        encoder: AudioEncoder.wav,
-        sampleRate: 44100,
-        numChannels: 1,
+      await _recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.wav,
+          sampleRate: 44100,
+          numChannels: 1,
+        ),
+        path: path,
       );
 
-      await _recorder.start(cfg, path: path);
-
-      // ✅ Antes era 5 minutos fijo. Ahora usa chunk_seconds del config.
       final dur = Duration(milliseconds: (widget.chunkSeconds * 1000).round());
+      int lastShownSec = -1;
 
-      // Loop con polling para poder cancelar rápido
       for (var ms = 0; ms < dur.inMilliseconds; ms += 200) {
         if (_cancelado) break;
         await Future.delayed(const Duration(milliseconds: 200));
+
+        final sec = (ms / 1000).floor();
+        if (sec != lastShownSec) {
+          lastShownSec = sec;
+          if (!mounted) break;
+          setState(() {
+            item.progressSeconds =
+                (sec + 1).clamp(0, item.totalSeconds);
+          });
+        }
       }
+
       if (_cancelado) break;
 
-      final finalPath = await _recorder.stop();
-      final realPath = finalPath ?? path;
+      await _recorder.stop();
 
       setState(() {
-        final idx = _items.indexWhere((e) => e.index == item.index);
-        if (idx != -1) {
-          _items[idx].finishedAt = DateTime.now();
-          _items[idx].status = UploadStatus.enviando;
-        }
+        item.finishedAt = DateTime.now();
+        item.status = UploadStatus.enviando;
+        item.progressSeconds = item.totalSeconds;
       });
 
       _hechos++;
-      unawaited(_subirArchivo(realPath, item.index));
-    }
-
-    if (mounted && !_cancelado) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Monitoreo finalizado ($_hechos/${widget.cantidad})'),
-        ),
-      );
-    }
-  }
-
-  Future<void> _subirArchivo(String filePath, int itemIndex) async {
-    try {
-      final file = File(filePath);
-      if (!await file.exists()) throw 'Archivo no encontrado';
-
-      final len = await file.length();
-      if (len == 0) throw 'Archivo vacío (0 bytes)';
-
-      // Intentamos obtener coordenadas justo antes de subir
-      final pos = await _getPositionSafe();
-
-      final uri = Uri.parse(widget.endpointUrl);
-      print('[UPLOAD] → $uri');
-      print('[UPLOAD] Archivo: ${file.path} (${len} bytes)');
-
-      final req = http.MultipartRequest('POST', uri);
-
-      // Campos extra
-      req.fields['deviceName'] = widget.deviceName;
-      if (pos != null) {
-        req.fields['latitude'] = pos.latitude.toString();
-        req.fields['longitude'] = pos.longitude.toString();
-      }
-
-      // Archivo
-      req.files.add(
-        await http.MultipartFile.fromPath(
-          'audio', // clave en minúsculas
-          file.path,
-          contentType: MediaType('audio', 'wav'),
-          filename: file.uri.pathSegments.last,
-        ),
-      );
-
-      final resp = await req.send();
-      final body = await resp.stream.bytesToString();
-      print('[UPLOAD] Status: ${resp.statusCode}');
-      print('[UPLOAD] Body: $body');
-
-      if (!mounted) return;
-      setState(() {
-        final idx = _items.indexWhere((e) => e.index == itemIndex);
-        if (idx != -1) {
-          _items[idx].status =
-              (resp.statusCode >= 200 && resp.statusCode < 300)
-                  ? UploadStatus.enviado
-                  : UploadStatus.fallo;
-          if (resp.statusCode < 200 || resp.statusCode >= 300) {
-            _items[idx].error = 'HTTP ${resp.statusCode}';
-          }
-        }
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        final idx = _items.indexWhere((e) => e.index == itemIndex);
-        if (idx != -1) {
-          _items[idx].status = UploadStatus.fallo;
-          _items[idx].error = e.toString();
-        }
-      });
-      print('[UPLOAD][ERROR] $e');
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final restantes = widget.cantidad - _hechos;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Monitoreo'),
-        actions: [
-          TextButton.icon(
-            onPressed: () {
-              _cancelado = true;
-              _recorder.cancel();
-              if (mounted) Navigator.of(context).pop();
-            },
-            icon: const Icon(Icons.stop_circle_outlined),
-            label: const Text('Detener',
-                style: TextStyle(fontWeight: FontWeight.bold)),
-          )
-        ],
-      ),
-      body: Column(
-        children: [
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Grabando segmentos WAV de ${widget.chunkSeconds}s\nEnvío: POST → audio + deviceName + lat/long',
-                    style: Theme.of(context).textTheme.bodyMedium,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Chip(
-                  label: Text('Restantes: $restantes'),
-                ),
-              ],
+      appBar: AppBar(title: const Text('Monitoreo')),
+      body: ListView.separated(
+        padding: const EdgeInsets.all(12),
+        itemCount: _items.length,
+        separatorBuilder: (_, __) => const Divider(),
+        itemBuilder: (_, i) {
+          final a = _items[i];
+          return ListTile(
+            leading: Icon(
+              a.status == UploadStatus.grabando
+                  ? Icons.mic
+                  : Icons.cloud_upload_outlined,
             ),
-          ),
-          const SizedBox(height: 8),
-          const Divider(height: 1),
-          Expanded(
-            child: ListView.separated(
-              padding: const EdgeInsets.all(12),
-              itemBuilder: (_, i) {
-                final a = _items[i];
-                return ListTile(
-                  leading: Icon(
-                    a.status == UploadStatus.grabando
-                        ? Icons.mic
-                        : a.status == UploadStatus.enviando
-                            ? Icons.cloud_upload_outlined
-                            : a.status == UploadStatus.enviado
-                                ? Icons.check_circle
-                                : Icons.error_outline,
-                  ),
-                  title: Text(a.fileName,
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
-                  subtitle: Text(
-                    a.status == UploadStatus.grabando
-                        ? 'Grabando...'
-                        : a.status == UploadStatus.enviando
-                            ? 'Enviando...'
-                            : a.status == UploadStatus.enviado
-                                ? 'Enviado'
-                                : 'Falló${a.error != null ? ': ${a.error}' : ''}',
-                  ),
-                  trailing: Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text('Inicio: ${_fmt(a.startedAt)}'),
-                      if (a.finishedAt != null)
-                        Text('Fin: ${_fmt(a.finishedAt!)}'),
-                    ],
-                  ),
-                );
-              },
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemCount: _items.length,
+            title: Text(a.fileName),
+            subtitle: Text(
+              a.status == UploadStatus.grabando
+                  ? 'Grabando... (${a.progressSeconds}/${a.totalSeconds})'
+                  : 'Enviando...',
             ),
-          ),
-        ],
+          );
+        },
       ),
     );
-  }
-
-  String _fmt(DateTime d) {
-    final two = (int n) => n.toString().padLeft(2, '0');
-    return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
   }
 }
