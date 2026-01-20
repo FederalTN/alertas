@@ -79,6 +79,6 @@ wheels/
 .installed.cfg
 *.egg
 audios/
-.pt
-.parquet
-downloaded_models/
+*.pt
+*.parquet
+*.wav

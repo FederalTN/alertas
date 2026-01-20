@@ -1,3 +1,4 @@
-timestamp,deviceName,latitude,longitude,originalname,filename,size,mimetype,path,client_ip,category,detection_sum,detection_text
-2026-01-06T12:02:14.743643+00:00,MiDispositivo1,-39.8142,-73.2459,audio_1_2026-01-06T04-02-09-547543.wav,audio_1_2026-01-06t04-02-09-547543_20260106_040214.wav,429858,audio/wav,audios/audio_1_2026-01-06t04-02-09-547543_20260106_040214.wav,127.0.0.1,Batrachyla_leptopus,true,1
-2026-01-06T12:02:19.747261+00:00,MiDispositivo1,-39.8142,-73.2459,audio_2_2026-01-06T04-02-14-637508.wav,audio_2_2026-01-06t04-02-14-637508_20260106_040219.wav,445286,audio/wav,audios/audio_2_2026-01-06t04-02-14-637508_20260106_040219.wav,127.0.0.1,,false,0
+timestamp,deviceName,latitude,longitude,originalname,filename,size,mimetype,path,client_ip,deteccion_texto,deteccion_num,categoria
+2026-01-20T12:37:26.825050+00:00,MiDispositivo,,,audio_1_2026-01-20T04-37-19-003003.wav,audio_1_2026-01-20t04-37-19-003003_20260120_043724.wav,432062,audio/wav,audios/audio_1_2026-01-20t04-37-19-003003_20260120_043724.wav,127.0.0.1,true,1,Batrachyla_taeniata
+2026-01-20T12:37:32.329372+00:00,MiDispositivo,,,audio_2_2026-01-20T04-37-26-840788.wav,audio_2_2026-01-20t04-37-26-840788_20260120_043731.wav,440878,audio/wav,audios/audio_2_2026-01-20t04-37-26-840788_20260120_043731.wav,127.0.0.1,true,1,Batrachyla_taeniata
+2026-01-20T12:37:37.706927+00:00,MiDispositivo,,,audio_3_2026-01-20T04-37-32-332276.wav,audio_3_2026-01-20t04-37-32-332276_20260120_043737.wav,443082,audio/wav,audios/audio_3_2026-01-20t04-37-32-332276_20260120_043737.wav,127.0.0.1,false,0,

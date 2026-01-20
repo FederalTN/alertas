@@ -1,0 +1,88 @@
+# @package _global_
+
+# Usage: python main_win.py +experiment=audio_splitted/bird_net_vae
+# Run TWICE: first to generate config templates, second to train
+
+defaults:
+  - override /algorithm: soundscape_autoencoder
+  - override /data_module: audio_splitted/bird_net  
+  - override /encoder: bird_net
+  - override /decoder: inverse_bird_net
+  - override /model: vae
+  - override /callback: spectrogram_logger
+  - override /persistence_strategy: parquet
+  - _self_
+
+train: true
+predict: true
+save: true
+name: bird_net_vae_audio_splitted
+
+# Embeddings output location
+persistence_strategy:
+  _target_: soundscape_vae.algorithm.persistence.Parquet
+  file_path: ./embeddings/${ name }
+  upload: false
+
+# Algorithm / training parameters
+algorithm:
+  _target_: soundscape_vae.algorithm.soundscape_autoencoder.SoundscapeAutoencoder
+  learning_rate: 4.e-5
+  optimiser_cls: torch.optim.AdamW
+  scheduler_cls: torch.optim.lr_scheduler.CosineAnnealingLR
+  scheduler_config:
+    T_max: ${ trainer.max_steps }
+    eta_min: 4.e-7
+
+# VAE hyperparameters
+model:
+  _target_: soundscape_vae.models.vae._VAE
+  sigma_mode: global
+
+# Encoder (BirdNet-style CNN)
+encoder:
+  _target_: soundscape_vae.models.encoders.bird_net._BirdNet
+  width: 4
+  depth: 3
+  dropout_prob: 0.5
+  in_channels: 1
+  out_channels: 2
+  out_features: 128
+  weight_init_std: 1.e-2
+  frame_hop_length: 6
+
+# Decoder
+decoder:
+  _target_: soundscape_vae.models.decoders.inverse_birdnet._InverseBirdNet
+  width: 4
+  depth: 3
+  dropout_prob: 0.5
+  in_features: 128
+  out_channels: 1
+  frame_hop_length: 6
+
+# Spectrogram logger callback
+callback:
+  _target_: soundscape_vae.callbacks.spectrogram_logger.SpectrogramLogger
+  batch_limit: 10
+  sample_rate: ${ data_module.sample_rate }
+  window_length: 512
+  hop_length: 384
+  step_every: 500
+  min_hertz: 150
+  max_hertz: 15000
+  cmap: viridis
+
+# Checkpoint settings
+checkpoint:
+  monitor: val/loss
+  mode: min
+
+# PyTorch Lightning Trainer
+trainer:
+  accelerator: gpu
+  devices: 1
+  max_steps: 10000
+  max_epochs: -1
+  log_every_n_steps: 50
+  val_check_interval: 250

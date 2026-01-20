@@ -52,7 +52,11 @@ class SetupPage extends StatefulWidget {
 class _SetupPageState extends State<SetupPage> {
   final _formKey = GlobalKey<FormState>();
   final _cantidadCtrl = TextEditingController(text: '3');
-  final _urlCtrl = TextEditingController(text: 'http://localhost:4000/api/audio');
+
+  // Android Emulator -> localhost PC
+  final _urlCtrl =
+      TextEditingController(text: 'http://10.0.2.2:4000/api/audio');
+
   final _deviceNameCtrl = TextEditingController(text: 'MiDispositivo');
 
   double? _chunkSeconds;
@@ -115,9 +119,12 @@ class _SetupPageState extends State<SetupPage> {
                   labelText: 'URL de destino (POST)',
                 ),
                 validator: (v) {
-                  if (v == null || v.isEmpty) return 'La URL es requerida';
-                  final ok = Uri.tryParse(v)?.hasAbsolutePath ?? false;
-                  if (!ok) return 'Ingresa una URL válida';
+                  final s = (v ?? '').trim();
+                  if (s.isEmpty) return 'La URL es requerida';
+                  final uri = Uri.tryParse(s);
+                  if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+                    return 'Ingresa una URL válida (ej: http://host:puerto/ruta)';
+                  }
                   return null;
                 },
               ),
@@ -168,23 +175,30 @@ class AudioItem {
   AudioItem({
     required this.index,
     required this.fileName,
+    required this.filePath,
     required this.startedAt,
     required this.totalSeconds,
     this.progressSeconds = 0,
     this.finishedAt,
     this.status = UploadStatus.grabando,
     this.error,
+    this.latitude,
+    this.longitude,
   });
 
   final int index;
   final String fileName;
+  final String filePath;
   final DateTime startedAt;
   DateTime? finishedAt;
   UploadStatus status;
   String? error;
 
-  int progressSeconds;      // ✅ segundos actuales
-  final int totalSeconds;   // ✅ segundos totales
+  int progressSeconds;
+  final int totalSeconds;
+
+  String? latitude;
+  String? longitude;
 }
 
 /// ---------------------------
@@ -212,7 +226,6 @@ class _MonitorPageState extends State<MonitorPage> {
   final _recorder = AudioRecorder();
   bool _cancelado = false;
   bool _iniciado = false;
-  int _hechos = 0;
   final List<AudioItem> _items = [];
 
   @override
@@ -245,6 +258,69 @@ class _MonitorPageState extends State<MonitorPage> {
     return '${dir.path}/audio_${idx + 1}_$ts.wav';
   }
 
+  /// Asegura permisos de ubicación y obtiene posición (best effort).
+  /// Si no hay permisos o falla, devuelve null.
+  Future<Position?> _getPositionBestEffort() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return null;
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return null;
+      }
+
+      // Intenta una posición con precisión razonable
+      return await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 10),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Envia multipart/form-data como tu FastAPI espera:
+  /// - file field: "audio"
+  /// - form field requerido: "deviceName"
+  /// - opcionales: "latitude", "longitude"
+  Future<void> _subirAudio({
+    required Uri endpoint,
+    required String filePath,
+    required String deviceName,
+    String? latitude,
+    String? longitude,
+  }) async {
+    final req = http.MultipartRequest('POST', endpoint);
+
+    req.fields['deviceName'] = deviceName;
+    if (latitude != null && latitude.trim().isNotEmpty) {
+      req.fields['latitude'] = latitude.trim();
+    }
+    if (longitude != null && longitude.trim().isNotEmpty) {
+      req.fields['longitude'] = longitude.trim();
+    }
+
+    req.files.add(
+      await http.MultipartFile.fromPath(
+        'audio', // <- CLAVE: tu server.py espera "audio"
+        filePath,
+        contentType: MediaType('audio', 'wav'),
+      ),
+    );
+
+    final streamed = await req.send().timeout(const Duration(seconds: 60));
+    final body = await streamed.stream.bytesToString();
+
+    if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+      throw Exception('HTTP ${streamed.statusCode}: $body');
+    }
+  }
+
   Future<void> _iniciar() async {
     if (_iniciado) return;
     _iniciado = true;
@@ -258,6 +334,8 @@ class _MonitorPageState extends State<MonitorPage> {
       return;
     }
 
+    final endpoint = Uri.parse(widget.endpointUrl);
+
     for (var i = 0; i < widget.cantidad && !_cancelado; i++) {
       final path = await _nuevoPathWav(i);
       final totalSec = widget.chunkSeconds.round();
@@ -265,6 +343,7 @@ class _MonitorPageState extends State<MonitorPage> {
       final item = AudioItem(
         index: i,
         fileName: path.split('/').last,
+        filePath: path,
         startedAt: DateTime.now(),
         totalSeconds: totalSec,
       );
@@ -292,8 +371,7 @@ class _MonitorPageState extends State<MonitorPage> {
           lastShownSec = sec;
           if (!mounted) break;
           setState(() {
-            item.progressSeconds =
-                (sec + 1).clamp(0, item.totalSeconds);
+            item.progressSeconds = (sec + 1).clamp(0, item.totalSeconds);
           });
         }
       }
@@ -308,7 +386,36 @@ class _MonitorPageState extends State<MonitorPage> {
         item.progressSeconds = item.totalSeconds;
       });
 
-      _hechos++;
+      // Obtener ubicación (best effort)
+      final pos = await _getPositionBestEffort();
+      final lat = pos?.latitude.toString();
+      final lon = pos?.longitude.toString();
+
+      if (!mounted) return;
+      setState(() {
+        item.latitude = lat;
+        item.longitude = lon;
+      });
+
+      // SUBIR
+      try {
+        await _subirAudio(
+          endpoint: endpoint,
+          filePath: item.filePath,
+          deviceName: widget.deviceName,
+          latitude: lat,
+          longitude: lon,
+        );
+
+        if (!mounted) return;
+        setState(() => item.status = UploadStatus.enviado);
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          item.status = UploadStatus.fallo;
+          item.error = e.toString();
+        });
+      }
     }
   }
 
@@ -322,18 +429,28 @@ class _MonitorPageState extends State<MonitorPage> {
         separatorBuilder: (_, __) => const Divider(),
         itemBuilder: (_, i) {
           final a = _items[i];
+
+          final subtitle = switch (a.status) {
+            UploadStatus.grabando =>
+              'Grabando... (${a.progressSeconds}/${a.totalSeconds})',
+            UploadStatus.enviando => 'Enviando...',
+            UploadStatus.enviado =>
+              'Enviado (${a.latitude ?? "-"}, ${a.longitude ?? "-"})',
+            UploadStatus.fallo => 'Falló: ${a.error ?? "desconocido"}',
+          };
+
           return ListTile(
             leading: Icon(
               a.status == UploadStatus.grabando
                   ? Icons.mic
-                  : Icons.cloud_upload_outlined,
+                  : a.status == UploadStatus.enviado
+                      ? Icons.check_circle_outline
+                      : a.status == UploadStatus.fallo
+                          ? Icons.error_outline
+                          : Icons.cloud_upload_outlined,
             ),
             title: Text(a.fileName),
-            subtitle: Text(
-              a.status == UploadStatus.grabando
-                  ? 'Grabando... (${a.progressSeconds}/${a.totalSeconds})'
-                  : 'Enviando...',
-            ),
+            subtitle: Text(subtitle),
           );
         },
       ),

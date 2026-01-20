@@ -18,13 +18,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# -------------------- Detector import --------------------
+# Si el módulo no es importable o faltan deps, el server sigue funcionando,
+# pero marcará detección = false y devolverá un warning.
+try:
+    from latent_space_exploration.evaluate_wav_detection import detect_species
+except Exception as e:
+    detect_species = None  # type: ignore
+    DETECTOR_IMPORT_ERROR = str(e)
+else:
+    DETECTOR_IMPORT_ERROR = ""
+
 # -------------------- Config --------------------
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 PORT = int(os.getenv("PORT", "4000"))
 HOST = os.getenv("HOST", "0.0.0.0")
 
-UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", BASE_DIR / "audios"))
-CSV_PATH = pathlib.Path(os.getenv("CSV_PATH", BASE_DIR / "registros.csv"))
+UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "audios")))
+CSV_PATH = pathlib.Path(os.getenv("CSV_PATH", str(BASE_DIR / "registros.csv")))
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(50 * 1024 * 1024)))  # 50 MB
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,15 +51,54 @@ CSV_HEADERS = [
     "mimetype",
     "path",
     "client_ip",
+    # NUEVO (detección):
+    "deteccion_texto",  # "true"/"false"
+    "deteccion_num",    # "1"/"0"
+    "categoria",        # especie o ""
 ]
 
-def ensure_csv():
+def ensure_csv_schema():
+    """
+    Crea el CSV si no existe. Si existe con header antiguo, migra agregando nuevas columnas.
+    """
     if not CSV_PATH.exists():
         with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
             writer.writeheader()
+        return
 
-ensure_csv()
+    # Leer header existente
+    existing_header: Optional[List[str]] = None
+    try:
+        with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            existing_header = next(reader, None)
+    except Exception:
+        existing_header = None
+
+    if not existing_header:
+        # archivo vacío/corrupto -> reescribir header
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+            writer.writeheader()
+        return
+
+    missing = [h for h in CSV_HEADERS if h not in existing_header]
+    if not missing:
+        return
+
+    # Migración: reescribir a un tmp con el header nuevo, rellenando faltantes con ""
+    tmp_path = CSV_PATH.with_suffix(".tmp")
+    with open(CSV_PATH, "r", newline="", encoding="utf-8") as src, open(tmp_path, "w", newline="", encoding="utf-8") as dst:
+        src_reader = csv.DictReader(src)
+        dst_writer = csv.DictWriter(dst, fieldnames=CSV_HEADERS)
+        dst_writer.writeheader()
+        for row in src_reader:
+            out = {h: (row.get(h, "") if row else "") for h in CSV_HEADERS}
+            dst_writer.writerow(out)
+    tmp_path.replace(CSV_PATH)
+
+ensure_csv_schema()
 
 def slugify(name: str) -> str:
     base = pathlib.Path(name).stem
@@ -64,7 +114,7 @@ def norm_device(name: str) -> str:
     return (name or "").strip().lower()
 
 # -------------------- App --------------------
-app = FastAPI(title="Audio Uploader (FastAPI)", version="2.0.0")
+app = FastAPI(title="Audio Uploader (FastAPI)", version="2.1.0")
 
 # CORS abierto para pruebas (ajusta en producción)
 app.add_middleware(
@@ -80,7 +130,12 @@ app.mount("/audios", StaticFiles(directory=str(UPLOAD_DIR)), name="audios")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": iso_now()}
+    return {
+        "status": "ok",
+        "time": iso_now(),
+        "detector_available": detect_species is not None,
+        "detector_import_error": DETECTOR_IMPORT_ERROR if detect_species is None else "",
+    }
 
 # -------------------- Estado en memoria (WS) --------------------
 class Client:
@@ -116,7 +171,7 @@ async def _safe_send_json(ws: WebSocket, payload: dict):
         return False
 
 async def _broadcast_new_audio(row: dict):
-    """Notifica a los clientes suscritos a row['deviceName']."""
+    """Notifica a los clientes suscritos a row['deviceName']."""  # noqa: D401
     device = norm_device(row.get("deviceName", ""))
     if not device:
         return
@@ -126,14 +181,17 @@ async def _broadcast_new_audio(row: dict):
 
     event = {
         "type": "new_audio",
-        "deviceName": row["deviceName"],
-        "timestamp": row["timestamp"],
-        "filename": row["filename"],
-        "size": row["size"],
-        "urlPath": f"/audios/{row['filename']}",
-        # NUEVO:
+        "deviceName": row.get("deviceName", ""),
+        "timestamp": row.get("timestamp", ""),
+        "filename": row.get("filename", ""),
+        "size": row.get("size", ""),
+        "urlPath": f"/audios/{row.get('filename', '')}",
         "latitude": row.get("latitude", ""),
         "longitude": row.get("longitude", ""),
+        # NUEVO detección:
+        "deteccion_texto": row.get("deteccion_texto", ""),
+        "deteccion_num": row.get("deteccion_num", ""),
+        "categoria": row.get("categoria", ""),
     }
 
     drops: List[str] = []
@@ -257,22 +315,26 @@ def list_audios(deviceName: str, limit: int = 50):
     rows = rows[: max(1, min(limit, 500))]
 
     # mapea respuesta (ligera)
-    return [
-        {
-            "timestamp": r["timestamp"],
-            "deviceName": r["deviceName"],
-            "filename": r["filename"],
-            "size": int(r.get("size", "0") or 0),
-            "urlPath": f"/audios/{r['filename']}",
-            # NUEVO:
-            "latitude": r.get("latitude", ""),
-            "longitude": r.get("longitude", ""),
-        }
-        for r in rows
-    ]
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "timestamp": r.get("timestamp", ""),
+                "deviceName": r.get("deviceName", ""),
+                "filename": r.get("filename", ""),
+                "size": int(r.get("size", "0") or 0),
+                "urlPath": f"/audios/{r.get('filename', '')}",
+                "latitude": r.get("latitude", ""),
+                "longitude": r.get("longitude", ""),
+                # NUEVO detección:
+                "deteccion_texto": r.get("deteccion_texto", ""),
+                "deteccion_num": int(r.get("deteccion_num", "0") or 0),
+                "categoria": r.get("categoria", ""),
+            }
+        )
+    return out
 
-
-# -------------------- Upload de audio (ya lo tenías) --------------------
+# -------------------- Upload de audio --------------------
 @app.post("/api/audio")
 async def upload_audio(
     request: Request,
@@ -311,6 +373,25 @@ async def upload_audio(
         raise HTTPException(status_code=500, detail=f"Error saving file: {e}")
 
     client_ip = request.client.host if request.client else ""
+
+    # -------------------- Detección (antes de CSV) --------------------
+    detected_bool = False
+    detected_species = ""
+    detector_warning = ""
+
+    if detect_species is None:
+        detector_warning = f"Detector no disponible (import error): {DETECTOR_IMPORT_ERROR}"
+    else:
+        try:
+            # detect_species es CPU/I/O-bound (librosa + torch load/encode).
+            # Ejecutarlo en thread evita bloquear el event-loop.
+            detected_bool, sp = await asyncio.to_thread(detect_species, str(dest_path))
+            detected_species = sp or ""
+        except Exception as e:
+            detector_warning = f"Fallo detección: {e}"
+            detected_bool = False
+            detected_species = ""
+
     row = {
         "timestamp": iso_now(),
         "deviceName": deviceName,
@@ -322,6 +403,10 @@ async def upload_audio(
         "mimetype": audio.content_type or "",
         "path": str(dest_path),
         "client_ip": client_ip,
+        # NUEVO:
+        "deteccion_texto": "true" if detected_bool else "false",
+        "deteccion_num": "1" if detected_bool else "0",
+        "categoria": detected_species,
     }
 
     # Append al CSV
@@ -337,7 +422,13 @@ async def upload_audio(
             "filename": filename,
             "size": total,
             "path": str(dest_path),
+            "deteccion_texto": row["deteccion_texto"],
+            "deteccion_num": int(row["deteccion_num"]),
+            "categoria": row["categoria"],
         }
+        if detector_warning:
+            res["detector_warning"] = detector_warning
+
         # Notifica igualmente
         asyncio.create_task(_broadcast_new_audio(row))
         return JSONResponse(status_code=201, content=res)
@@ -345,14 +436,21 @@ async def upload_audio(
     # Notifica a suscriptores de ese device
     asyncio.create_task(_broadcast_new_audio(row))
 
-    return {
+    res = {
         "ok": True,
         "filename": filename,
         "size": total,
         "path": str(dest_path),
+        "deteccion_texto": row["deteccion_texto"],
+        "deteccion_num": int(row["deteccion_num"]),
+        "categoria": row["categoria"],
     }
+    if detector_warning:
+        res["detector_warning"] = detector_warning
+    return res
 
 # -------------------- Arranque por comando --------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host=HOST, port=PORT, reload=True)
+
