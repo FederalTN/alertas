@@ -8,7 +8,7 @@ import uuid
 import pathlib
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional, Dict, Set, List
+from typing import Optional, Dict, Set, List, Any
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -19,8 +19,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------- Detector import --------------------
-# Si el módulo no es importable o faltan deps, el server sigue funcionando,
-# pero marcará detección = false y devolverá un warning.
 try:
     from latent_space_exploration.evaluate_wav_detection import detect_species
 except Exception as e:
@@ -67,7 +65,6 @@ def ensure_csv_schema():
             writer.writeheader()
         return
 
-    # Leer header existente
     existing_header: Optional[List[str]] = None
     try:
         with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
@@ -77,7 +74,6 @@ def ensure_csv_schema():
         existing_header = None
 
     if not existing_header:
-        # archivo vacío/corrupto -> reescribir header
         with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
             writer.writeheader()
@@ -87,7 +83,6 @@ def ensure_csv_schema():
     if not missing:
         return
 
-    # Migración: reescribir a un tmp con el header nuevo, rellenando faltantes con ""
     tmp_path = CSV_PATH.with_suffix(".tmp")
     with open(CSV_PATH, "r", newline="", encoding="utf-8") as src, open(tmp_path, "w", newline="", encoding="utf-8") as dst:
         src_reader = csv.DictReader(src)
@@ -113,10 +108,37 @@ def iso_now() -> str:
 def norm_device(name: str) -> str:
     return (name or "").strip().lower()
 
-# -------------------- App --------------------
-app = FastAPI(title="Audio Uploader (FastAPI)", version="2.1.0")
+def _to_float_or_none(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
 
-# CORS abierto para pruebas (ajusta en producción)
+def _to_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return 1 if v else 0
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).strip()
+        if not s:
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+# -------------------- App --------------------
+app = FastAPI(title="Audio Uploader (FastAPI)", version="2.1.1")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -125,7 +147,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Servir los audios subidos:  GET http://<host>:<port>/audios/<filename>
 app.mount("/audios", StaticFiles(directory=str(UPLOAD_DIR)), name="audios")
 
 @app.get("/health")
@@ -142,11 +163,11 @@ class Client:
     def __init__(self, user_id: str, ws: WebSocket):
         self.user_id = user_id
         self.ws = ws
-        self.subs: Set[str] = set()  # deviceName normalizados
+        self.subs: Set[str] = set()
         self.last_seen: float = time.time()
 
 clients: Dict[str, Client] = {}
-device_subs: Dict[str, Set[str]] = {}  # device -> set(user_id)
+device_subs: Dict[str, Set[str]] = {}
 CLIENT_TIMEOUT_SEC = 30
 
 def _add_sub(user_id: str, device: str):
@@ -171,7 +192,6 @@ async def _safe_send_json(ws: WebSocket, payload: dict):
         return False
 
 async def _broadcast_new_audio(row: dict):
-    """Notifica a los clientes suscritos a row['deviceName']."""  # noqa: D401
     device = norm_device(row.get("deviceName", ""))
     if not device:
         return
@@ -179,18 +199,23 @@ async def _broadcast_new_audio(row: dict):
     if not user_ids:
         return
 
+    size_int = _to_int(row.get("size", 0), 0)
+    det_int = _to_int(row.get("deteccion_num", 0), 0)
+
+    lat = _to_float_or_none(row.get("latitude", None))
+    lon = _to_float_or_none(row.get("longitude", None))
+
     event = {
         "type": "new_audio",
         "deviceName": row.get("deviceName", ""),
         "timestamp": row.get("timestamp", ""),
         "filename": row.get("filename", ""),
-        "size": row.get("size", ""),
+        "size": size_int,
         "urlPath": f"/audios/{row.get('filename', '')}",
-        "latitude": row.get("latitude", ""),
-        "longitude": row.get("longitude", ""),
-        # NUEVO detección:
+        "latitude": lat,
+        "longitude": lon,
         "deteccion_texto": row.get("deteccion_texto", ""),
-        "deteccion_num": row.get("deteccion_num", ""),
+        "deteccion_num": det_int,
         "categoria": row.get("categoria", ""),
     }
 
@@ -204,14 +229,12 @@ async def _broadcast_new_audio(row: dict):
         if not ok:
             drops.append(uid)
 
-    # Limpia subs de clientes que fallaron al enviar
     for uid in drops:
         for dev in list(device_subs.keys()):
             _remove_sub(uid, dev)
         clients.pop(uid, None)
 
 async def _gc_loop():
-    """Cierra y limpia clientes inactivos (>30s sin ping)."""
     while True:
         await asyncio.sleep(5)
         now = time.time()
@@ -226,7 +249,6 @@ async def _gc_loop():
                     await c.ws.close()
                 except Exception:
                     pass
-            # borra suscripciones
             for dev in list(device_subs.keys()):
                 _remove_sub(uid, dev)
 
@@ -257,13 +279,11 @@ async def ws_endpoint(ws: WebSocket):
 
             if action == "subscribe":
                 names = data.get("deviceNames") or []
-                names = [norm_device(n) for n in names if n and n.strip()]
-                # quita las que ya no están
+                names = [norm_device(n) for n in names if n and str(n).strip()]
                 for dev in list(client.subs):
                     if dev not in names:
                         _remove_sub(user_id, dev)
                         client.subs.discard(dev)
-                # añade nuevas
                 for dev in names:
                     if dev not in client.subs:
                         _add_sub(user_id, dev)
@@ -275,7 +295,7 @@ async def ws_endpoint(ws: WebSocket):
 
             elif action == "unsubscribe":
                 names = data.get("deviceNames") or []
-                names = [norm_device(n) for n in names if n and n.strip()]
+                names = [norm_device(n) for n in names if n and str(n).strip()]
                 for dev in names:
                     _remove_sub(user_id, dev)
                     client.subs.discard(dev)
@@ -287,7 +307,6 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        # limpieza
         for dev in list(client.subs):
             _remove_sub(user_id, dev)
         clients.pop(user_id, None)
@@ -295,7 +314,6 @@ async def ws_endpoint(ws: WebSocket):
 # -------------------- HTTP: listar históricos --------------------
 @app.get("/api/audios")
 def list_audios(deviceName: str, limit: int = 50):
-    """Devuelve historial (más recientes primero) para un deviceName."""
     d = norm_device(deviceName)
     if not d:
         raise HTTPException(status_code=400, detail="deviceName requerido")
@@ -310,25 +328,24 @@ def list_audios(deviceName: str, limit: int = 50):
     except FileNotFoundError:
         rows = []
 
-    # ordena por timestamp desc
     rows.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
     rows = rows[: max(1, min(limit, 500))]
 
-    # mapea respuesta (ligera)
     out = []
     for r in rows:
+        lat = _to_float_or_none(r.get("latitude", None))
+        lon = _to_float_or_none(r.get("longitude", None))
         out.append(
             {
                 "timestamp": r.get("timestamp", ""),
                 "deviceName": r.get("deviceName", ""),
                 "filename": r.get("filename", ""),
-                "size": int(r.get("size", "0") or 0),
+                "size": _to_int(r.get("size", "0"), 0),
                 "urlPath": f"/audios/{r.get('filename', '')}",
-                "latitude": r.get("latitude", ""),
-                "longitude": r.get("longitude", ""),
-                # NUEVO detección:
+                "latitude": lat,
+                "longitude": lon,
                 "deteccion_texto": r.get("deteccion_texto", ""),
-                "deteccion_num": int(r.get("deteccion_num", "0") or 0),
+                "deteccion_num": _to_int(r.get("deteccion_num", "0"), 0),
                 "categoria": r.get("categoria", ""),
             }
         )
@@ -374,7 +391,6 @@ async def upload_audio(
 
     client_ip = request.client.host if request.client else ""
 
-    # -------------------- Detección (antes de CSV) --------------------
     detected_bool = False
     detected_species = ""
     detector_warning = ""
@@ -383,8 +399,6 @@ async def upload_audio(
         detector_warning = f"Detector no disponible (import error): {DETECTOR_IMPORT_ERROR}"
     else:
         try:
-            # detect_species es CPU/I/O-bound (librosa + torch load/encode).
-            # Ejecutarlo en thread evita bloquear el event-loop.
             detected_bool, sp = await asyncio.to_thread(detect_species, str(dest_path))
             detected_species = sp or ""
         except Exception as e:
@@ -403,19 +417,16 @@ async def upload_audio(
         "mimetype": audio.content_type or "",
         "path": str(dest_path),
         "client_ip": client_ip,
-        # NUEVO:
         "deteccion_texto": "true" if detected_bool else "false",
         "deteccion_num": "1" if detected_bool else "0",
         "categoria": detected_species,
     }
 
-    # Append al CSV
     try:
         with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
             writer.writerow(row)
     except Exception as e:
-        # seguimos, pero avisamos
         res = {
             "ok": True,
             "warning": f"No se pudo escribir en el CSV: {e}",
@@ -429,11 +440,9 @@ async def upload_audio(
         if detector_warning:
             res["detector_warning"] = detector_warning
 
-        # Notifica igualmente
         asyncio.create_task(_broadcast_new_audio(row))
         return JSONResponse(status_code=201, content=res)
 
-    # Notifica a suscriptores de ese device
     asyncio.create_task(_broadcast_new_audio(row))
 
     res = {
@@ -449,8 +458,6 @@ async def upload_audio(
         res["detector_warning"] = detector_warning
     return res
 
-# -------------------- Arranque por comando --------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host=HOST, port=PORT, reload=True)
-
